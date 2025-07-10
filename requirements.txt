@@ -1,0 +1,7 @@
+apache-airflow-providers-amazon
+boto3
+requests
+python-dotenv
+awswrangler
+scikit-learn
+pandas
