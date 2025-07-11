@@ -3,108 +3,127 @@ WITH (
     format = 'PARQUET',
     external_location = 's3://ucl-lake-2025/processed/dim_teams/'
 ) AS
--- Extract real teams data from JSON with fallback to static data
+-- Extract teams from JSON data - improved approach for fragmented data
 WITH teams_raw AS (
     SELECT 
         col0,
         year
     FROM ucl_analytics_db.raw
-    WHERE partition_0 = 'teams'
+    WHERE partition_0 IN ('teams', 'schedules', 'team_rosters')
+      AND year IN ('2024', '2025')
       AND col0 IS NOT NULL
-      AND LENGTH(col0) > 100
-      AND try(json_parse(col0)) IS NOT NULL
+      AND col0 != ''
+      AND LENGTH(col0) > 10
+      AND (col0 LIKE '%"team":%' OR col0 LIKE '%"competitor":%' OR col0 LIKE '%"participant":%' OR col0 LIKE '%"displayName":%')
 ),
-teams_parsed AS (
-    SELECT 
-        json_parse(col0) as json_data,
-        year
-    FROM teams_raw
-),
+-- Extract team information from fragments - more aggressive pattern matching
 teams_extracted AS (
-    -- Handle different possible JSON structures for teams data
     SELECT 
-        team_json,
-        year
-    FROM teams_parsed
-    CROSS JOIN UNNEST(
-        CASE 
-            -- If it's an array at root level
-            WHEN json_extract(json_data, '$[0].id') IS NOT NULL THEN 
-                CAST(json_data AS ARRAY(JSON))
-            -- If teams are nested under a 'teams' key
-            WHEN json_extract(json_data, '$.teams[0].id') IS NOT NULL THEN 
-                CAST(json_extract(json_data, '$.teams') AS ARRAY(JSON))
-            -- If it's a single team object
-            WHEN json_extract_scalar(json_data, '$.id') IS NOT NULL THEN 
-                ARRAY[json_data]
-            ELSE ARRAY[]
-        END
-    ) AS t(team_json)
-    WHERE json_extract_scalar(team_json, '$.id') IS NOT NULL
-),
-real_teams AS (
-    SELECT DISTINCT
-        json_extract_scalar(team_json, '$.id') as team_id,
+        -- Try multiple patterns for team ID
         COALESCE(
-            json_extract_scalar(team_json, '$.displayName'),
-            json_extract_scalar(team_json, '$.name'),
-            json_extract_scalar(team_json, '$.shortDisplayName')
+            REGEXP_EXTRACT(col0, '"id":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"id":\s*(\d+)', 1),
+            REGEXP_EXTRACT(col0, '"team_id":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"team_id":\s*(\d+)', 1)
+        ) as team_id,
+        -- Try multiple patterns for team name
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"displayName":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"name":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"team_name":\s*"([^"]+)"', 1)
         ) as team_name,
+        -- Try multiple patterns for abbreviation
         COALESCE(
-            json_extract_scalar(team_json, '$.abbreviation'),
-            json_extract_scalar(team_json, '$.abbrev')
+            REGEXP_EXTRACT(col0, '"abbreviation":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"abbrev":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"short_name":\s*"([^"]+)"', 1)
         ) as team_abbr,
+        -- Try multiple patterns for short name
         COALESCE(
-            json_extract_scalar(team_json, '$.shortDisplayName'),
-            json_extract_scalar(team_json, '$.name')
+            REGEXP_EXTRACT(col0, '"shortDisplayName":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"shortName":\s*"([^"]+)"', 1)
         ) as team_short_name,
+        -- Try multiple patterns for color
         COALESCE(
-            json_extract_scalar(team_json, '$.logo'),
-            json_extract_scalar(team_json, '$.logos[0].href')
-        ) as team_logo_url,
-        json_extract_scalar(team_json, '$.color') as team_color,
-        json_extract_scalar(team_json, '$.alternateColor') as team_alternate_color,
-        json_extract_scalar(team_json, '$.location') as team_location,
-        json_extract_scalar(team_json, '$.nickname') as team_nickname,
-        CAST(year AS INTEGER) as season_year,
-        CAST('2025-01-01 00:00:00.000' AS TIMESTAMP(3)) as created_at
+            REGEXP_EXTRACT(col0, '"color":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"teamColor":\s*"([^"]+)"', 1)
+        ) as team_color,
+        -- Try multiple patterns for alternate color
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"alternateColor":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"altColor":\s*"([^"]+)"', 1)
+        ) as team_alt_color,
+        -- Try multiple patterns for location
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"location":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"city":\s*"([^"]+)"', 1)
+        ) as team_location,
+        -- Try multiple patterns for logo
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"logo":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"logoUrl":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '(https://[^"]*teamlogos[^"]*)', 1)
+        ) as team_logo,
+        year,
+        col0
+    FROM teams_raw
+    WHERE col0 LIKE '%"id":%' 
+       OR col0 LIKE '%"team_id":%'
+       OR col0 LIKE '%"displayName":%'
+       OR col0 LIKE '%"name":%'
+       OR col0 LIKE '%"abbreviation":%'
+),
+-- Group by team_id and reconstruct complete records
+real_teams AS (
+    SELECT 
+        team_id,
+        MAX(team_name) as team_name,
+        MAX(team_abbr) as team_abbr,
+        MAX(team_short_name) as team_short_name,
+        MAX(team_logo) as team_logo_url,
+        CASE 
+            WHEN MAX(team_color) IS NOT NULL AND MAX(team_color) != '' THEN
+                CASE 
+                    WHEN MAX(team_color) LIKE '#%' THEN MAX(team_color)
+                    ELSE '#' || MAX(team_color)
+                END
+            ELSE '#000000'
+        END as team_color,
+        CASE 
+            WHEN MAX(team_alt_color) IS NOT NULL AND MAX(team_alt_color) != '' THEN
+                CASE 
+                    WHEN MAX(team_alt_color) LIKE '#%' THEN MAX(team_alt_color)
+                    ELSE '#' || MAX(team_alt_color)
+                END
+            ELSE '#FFFFFF'
+        END as team_alternate_color,
+        MAX(team_location) as team_location,
+        COALESCE(MAX(team_name), MAX(team_short_name), MAX(team_abbr)) as team_nickname,
+        CAST(MAX(year) AS INTEGER) as season_year,
+        CAST('2025-01-01 00:00:00.000' AS TIMESTAMP) as created_at
     FROM teams_extracted
-    WHERE json_extract_scalar(team_json, '$.id') IS NOT NULL
-      AND json_extract_scalar(team_json, '$.id') != ''
+    WHERE team_id IS NOT NULL
+      AND team_id != ''
+      AND LENGTH(team_id) > 0
+      AND (team_name IS NOT NULL OR team_abbr IS NOT NULL)
+    GROUP BY team_id
+),
+-- Count real teams found
+real_teams_count AS (
+    SELECT COUNT(*) as count_real_teams FROM real_teams
 )
--- Return real data if available, otherwise fallback to static data
-SELECT * FROM real_teams
-WHERE team_id IS NOT NULL
-
-UNION ALL
-
--- Fallback static data (only if no real data found)
+-- Return only real data - no static fallback
 SELECT 
-    '1' as team_id,
-    'Real Madrid' as team_name,
-    'RM' as team_abbr,
-    'Real Madrid' as team_short_name,
-    'https://example.com/logo1.png' as team_logo_url,
-    '#FFFFFF' as team_color,
-    '#000000' as team_alternate_color,
-    'Madrid, Spain' as team_location,
-    'Los Blancos' as team_nickname,
-    2025 as season_year,
-    CAST('2025-01-01 00:00:00.000' AS TIMESTAMP(3)) as created_at
-WHERE NOT EXISTS (SELECT 1 FROM real_teams)
-
-UNION ALL
-
-SELECT 
-    '2' as team_id,
-    'Barcelona' as team_name,
-    'BAR' as team_abbr,
-    'Barcelona' as team_short_name,
-    'https://example.com/logo2.png' as team_logo_url,
-    '#A50044' as team_color,
-    '#FCDD09' as team_alternate_color,
-    'Barcelona, Spain' as team_location,
-    'Blaugrana' as team_nickname,
-    2025 as season_year,
-    CAST('2025-01-01 00:00:00.000' AS TIMESTAMP(3)) as created_at
-WHERE NOT EXISTS (SELECT 1 FROM real_teams);
+    CAST(team_id AS VARCHAR) as team_id,
+    CAST(team_name AS VARCHAR) as team_name,
+    CAST(team_abbr AS VARCHAR) as team_abbr,
+    CAST(team_short_name AS VARCHAR) as team_short_name,
+    CAST(team_logo_url AS VARCHAR) as team_logo_url,
+    CAST(team_color AS VARCHAR) as team_color,
+    CAST(team_alternate_color AS VARCHAR) as team_alternate_color,
+    CAST(team_location AS VARCHAR) as team_location,
+    CAST(team_nickname AS VARCHAR) as team_nickname,
+    CAST(season_year AS INTEGER) as season_year,
+    CAST(created_at AS TIMESTAMP(3)) as created_at
+FROM real_teams
+WHERE team_id IS NOT NULL;

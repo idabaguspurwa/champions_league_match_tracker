@@ -3,189 +3,162 @@ WITH (
     format = 'PARQUET',
     external_location = 's3://ucl-lake-2025/processed/dim_players/'
 ) AS
--- Extract real players data from team rosters with fallback to static data
+-- Extract real players data from team rosters - improved fragment approach
 WITH rosters_raw AS (
     SELECT 
         col0,
         year
     FROM ucl_analytics_db.raw
     WHERE partition_0 = 'team_rosters'
+      AND year IN ('2024', '2025')
       AND col0 IS NOT NULL
-      AND LENGTH(col0) > 200
-      AND try(json_parse(col0)) IS NOT NULL
-      AND (col0 LIKE '%"athletes"%' OR col0 LIKE '%"roster"%' OR col0 LIKE '%"players"%')
+      AND LENGTH(col0) > 100  -- Reduced threshold for fragment detection
+      AND (col0 LIKE '%"athletes":%' OR col0 LIKE '%"id":%' OR col0 LIKE '%"displayName":%')
 ),
-rosters_parsed AS (
-    SELECT 
-        json_parse(col0) as json_data,
-        year
-    FROM rosters_raw
-    LIMIT 10 -- Process up to 10 roster files
-),
+-- Extract players from fragments - more aggressive pattern matching
 players_extracted AS (
-    -- Extract players from different possible JSON structures
     SELECT 
-        year,
-        CASE 
-            -- Athletes in root
-            WHEN json_extract(json_data, '$.athletes') IS NOT NULL THEN
-                CAST(json_extract(json_data, '$.athletes') AS ARRAY(JSON))
-            -- Players in root
-            WHEN json_extract(json_data, '$.players') IS NOT NULL THEN
-                CAST(json_extract(json_data, '$.players') AS ARRAY(JSON))
-            -- Roster.athletes
-            WHEN json_extract(json_data, '$.roster.athletes') IS NOT NULL THEN
-                CAST(json_extract(json_data, '$.roster.athletes') AS ARRAY(JSON))
-            -- Teams with athletes
-            WHEN json_extract(json_data, '$.team.athletes') IS NOT NULL THEN
-                CAST(json_extract(json_data, '$.team.athletes') AS ARRAY(JSON))
-            ELSE ARRAY[]
-        END as players_array,
-        -- Try to extract team info
+        -- Try multiple patterns for player ID
         COALESCE(
-            json_extract_scalar(json_data, '$.team.id'),
-            json_extract_scalar(json_data, '$.teamId')
-        ) as team_id
-    FROM rosters_parsed
-),
-real_players AS (
-    SELECT DISTINCT
-        json_extract_scalar(player_json, '$.id') as player_id,
+            REGEXP_EXTRACT(col0, '"id":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"id":\s*(\d+)', 1),
+            REGEXP_EXTRACT(col0, '"playerId":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"playerId":\s*(\d+)', 1)
+        ) as player_id,
+        -- Try multiple patterns for player name
         COALESCE(
-            json_extract_scalar(player_json, '$.displayName'),
-            json_extract_scalar(player_json, '$.fullName'),
-            CONCAT(
-                COALESCE(json_extract_scalar(player_json, '$.firstName'), ''),
-                ' ',
-                COALESCE(json_extract_scalar(player_json, '$.lastName'), '')
-            )
+            REGEXP_EXTRACT(col0, '"displayName":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"fullName":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"name":\s*"([^"]+)"', 1)
         ) as player_name,
-        json_extract_scalar(player_json, '$.firstName') as first_name,
-        json_extract_scalar(player_json, '$.lastName') as last_name,
+        -- Try multiple patterns for first name
         COALESCE(
-            json_extract_scalar(player_json, '$.jersey'),
-            json_extract_scalar(player_json, '$.jerseyNumber')
+            REGEXP_EXTRACT(col0, '"firstName":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"first_name":\s*"([^"]+)"', 1)
+        ) as first_name,
+        -- Try multiple patterns for last name
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"lastName":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"last_name":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"surname":\s*"([^"]+)"', 1)
+        ) as last_name,
+        -- Try multiple patterns for jersey number
+        COALESCE(
+            TRY(CAST(REGEXP_EXTRACT(col0, '"jersey":\s*"([^"]+)"', 1) AS VARCHAR)),
+            TRY(CAST(REGEXP_EXTRACT(col0, '"jerseyNumber":\s*"([^"]+)"', 1) AS VARCHAR)),
+            TRY(CAST(REGEXP_EXTRACT(col0, '"jersey":\s*(\d+)', 1) AS VARCHAR)),
+            TRY(CAST(REGEXP_EXTRACT(col0, '"jerseyNumber":\s*(\d+)', 1) AS VARCHAR))
         ) as jersey_number,
+        -- Try multiple patterns for position
         COALESCE(
-            json_extract_scalar(player_json, '$.position.displayName'),
-            json_extract_scalar(player_json, '$.position.name'),
-            json_extract_scalar(player_json, '$.position')
+            REGEXP_EXTRACT(col0, '"position":\s*\{[^}]*"displayName":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"position":\s*\{[^}]*"name":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"position":\s*"([^"]+)"', 1)
         ) as position,
-        json_extract_scalar(player_json, '$.position.abbreviation') as position_abbr,
-        TRY(CAST(json_extract_scalar(player_json, '$.age') AS INTEGER)) as age,
-        json_extract_scalar(player_json, '$.birthDate') as birth_date,
-        json_extract_scalar(player_json, '$.birthPlace.displayText') as birth_place,
-        json_extract_scalar(player_json, '$.citizenship') as nationality,
-        json_extract_scalar(player_json, '$.height') as height,
-        json_extract_scalar(player_json, '$.weight') as weight,
+        -- Try multiple patterns for position abbreviation
         COALESCE(
-            json_extract_scalar(player_json, '$.headshot.href'),
-            json_extract_scalar(player_json, '$.headshot')
-        ) as        headshot_url,
-        team_id,
-        CAST(year AS INTEGER) as season_year,
+            REGEXP_EXTRACT(col0, '"position":\s*\{[^}]*"abbreviation":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"positionAbbr":\s*"([^"]+)"', 1)
+        ) as position_abbr,
+        -- Try multiple patterns for age
+        COALESCE(
+            TRY(CAST(REGEXP_EXTRACT(col0, '"age":\s*(\d+)', 1) AS INTEGER)),
+            TRY(CAST(REGEXP_EXTRACT(col0, '"age":\s*"(\d+)"', 1) AS INTEGER))
+        ) as age,
+        -- Try multiple patterns for birth date
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"dateOfBirth":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"birthDate":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"dob":\s*"([^"]+)"', 1)
+        ) as birth_date,
+        -- Try multiple patterns for birth place
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"birthPlace":\s*\{[^}]*"displayText":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"birthPlace":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"placeOfBirth":\s*"([^"]+)"', 1)
+        ) as birth_place,
+        -- Try multiple patterns for nationality
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"citizenship":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"nationality":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"country":\s*"([^"]+)"', 1)
+        ) as nationality,
+        -- Try multiple patterns for height
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"displayHeight":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"height":\s*"([^"]+)"', 1)
+        ) as height,
+        -- Try multiple patterns for weight
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"displayWeight":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"weight":\s*"([^"]+)"', 1)
+        ) as weight,
+        -- Try multiple patterns for headshot
+        COALESCE(
+            REGEXP_EXTRACT(col0, '"headshot":\s*\{[^}]*"href":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"headshot":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"photo":\s*"([^"]+)"', 1),
+            REGEXP_EXTRACT(col0, '"image":\s*"([^"]+)"', 1)
+        ) as headshot_url,
+        year,
+        col0
+    FROM rosters_raw
+    WHERE col0 LIKE '%"id":%' 
+       OR col0 LIKE '%"playerId":%'
+       OR col0 LIKE '%"displayName":%'
+       OR col0 LIKE '%"fullName":%'
+       OR col0 LIKE '%"firstName":%'
+),
+-- Group by player_id and reconstruct complete records
+real_players AS (
+    SELECT 
+        CAST(player_id AS VARCHAR) as player_id,
+        CAST(MAX(player_name) AS VARCHAR) as player_name,
+        CAST(MAX(first_name) AS VARCHAR) as first_name,
+        CAST(MAX(last_name) AS VARCHAR) as last_name,
+        CAST(MAX(jersey_number) AS VARCHAR) as jersey_number,
+        CAST(MAX(position) AS VARCHAR) as position,
+        CAST(MAX(position_abbr) AS VARCHAR) as position_abbr,
+        CAST(MAX(age) AS INTEGER) as age,
+        CAST(MAX(birth_date) AS VARCHAR) as birth_date,
+        CAST(MAX(birth_place) AS VARCHAR) as birth_place,
+        CAST(MAX(nationality) AS VARCHAR) as nationality,
+        CAST(MAX(height) AS VARCHAR) as height,
+        CAST(MAX(weight) AS VARCHAR) as weight,
+        CAST(MAX(headshot_url) AS VARCHAR) as headshot_url,
+        CAST(NULL AS VARCHAR) as team_id,  -- Team ID not available from fragmented data
+        CAST(MAX(year) AS INTEGER) as season_year,
         CAST('2025-01-01 00:00:00.000' AS TIMESTAMP(3)) as created_at
     FROM players_extracted
-    CROSS JOIN UNNEST(players_array) AS t(player_json)
-    WHERE json_extract_scalar(player_json, '$.id') IS NOT NULL
-      AND json_extract_scalar(player_json, '$.id') != ''
-      AND LENGTH(TRIM(COALESCE(
-            json_extract_scalar(player_json, '$.displayName'),
-            json_extract_scalar(player_json, '$.fullName'),
-            CONCAT(
-                COALESCE(json_extract_scalar(player_json, '$.firstName'), ''),
-                ' ',
-                COALESCE(json_extract_scalar(player_json, '$.lastName'), '')
-            )
-        ))) > 2
-    LIMIT 500 -- Limit to prevent timeout
+    WHERE player_id IS NOT NULL
+      AND player_id != ''
+      AND LENGTH(player_id) > 0
+      AND (player_name IS NOT NULL OR first_name IS NOT NULL OR last_name IS NOT NULL)
+    GROUP BY player_id
+),
+-- Count real players found
+real_players_count AS (
+    SELECT COUNT(*) as count_real_players FROM real_players
 )
 -- Return real data if available, otherwise fallback to static data
 SELECT 
-    player_id,
-    player_name,
-    first_name,
-    last_name,
-    jersey_number,
-    position,
-    position_abbr,
-    age,
-    birth_date,
-    birth_place,
-    nationality,
-    height,
-    weight,
-    headshot_url,
-    team_id,
-    season_year,
-    created_at
+    CAST(player_id AS VARCHAR) as player_id,
+    CAST(player_name AS VARCHAR) as player_name,
+    CAST(first_name AS VARCHAR) as first_name,
+    CAST(last_name AS VARCHAR) as last_name,
+    CAST(jersey_number AS VARCHAR) as jersey_number,
+    CAST(position AS VARCHAR) as position,
+    CAST(position_abbr AS VARCHAR) as position_abbr,
+    CAST(age AS INTEGER) as age,
+    CAST(birth_date AS VARCHAR) as birth_date,
+    CAST(birth_place AS VARCHAR) as birth_place,
+    CAST(nationality AS VARCHAR) as nationality,
+    CAST(height AS VARCHAR) as height,
+    CAST(weight AS VARCHAR) as weight,
+    CAST(headshot_url AS VARCHAR) as headshot_url,
+    CAST(team_id AS VARCHAR) as team_id,
+    CAST(season_year AS INTEGER) as season_year,
+    CAST(created_at AS TIMESTAMP(3)) as created_at
 FROM real_players
 WHERE player_id IS NOT NULL
-  AND player_name IS NOT NULL
-
-UNION ALL
-
--- Fallback static data (only if no real data found)
-SELECT 
-    '1' as player_id,
-    'Karim Benzema' as player_name,
-    'Karim' as first_name,
-    'Benzema' as last_name,
-    '9' as jersey_number,
-    'Forward' as position,
-    'F' as position_abbr,
-    35 as age,
-    '1987-12-19' as birth_date,
-    'Lyon, France' as birth_place,
-    'France' as nationality,
-    '185 cm' as height,
-    '81 kg' as weight,
-    'https://example.com/benzema.jpg' as headshot_url,
-    '1' as team_id,
-    2025 as season_year,
-    CAST('2025-01-01 00:00:00.000' AS TIMESTAMP(3)) as created_at
-WHERE NOT EXISTS (SELECT 1 FROM real_players)
-
-UNION ALL
-
-SELECT 
-    '2' as player_id,
-    'Robert Lewandowski' as player_name,
-    'Robert' as first_name,
-    'Lewandowski' as last_name,
-    '9' as jersey_number,
-    'Forward' as position,
-    'F' as position_abbr,
-    35 as age,
-    '1988-08-21' as birth_date,
-    'Warsaw, Poland' as birth_place,
-    'Poland' as nationality,
-    '185 cm' as height,
-    '79 kg' as weight,
-    'https://example.com/lewandowski.jpg' as headshot_url,
-    '2' as team_id,
-    2025 as season_year,
-    CAST('2025-01-01 00:00:00.000' AS TIMESTAMP(3)) as created_at
-WHERE NOT EXISTS (SELECT 1 FROM real_players)
-
-UNION ALL
-
-SELECT 
-    '3' as player_id,
-    'Luka Modrić' as player_name,
-    'Luka' as first_name,
-    'Modrić' as last_name,
-    '10' as jersey_number,
-    'Midfielder' as position,
-    'M' as position_abbr,
-    38 as age,
-    '1985-09-09' as birth_date,
-    'Zadar, Croatia' as birth_place,
-    'Croatia' as nationality,
-    '172 cm' as height,
-    '66 kg' as weight,
-    'https://example.com/modric.jpg' as headshot_url,
-    '1' as team_id,
-    2025 as season_year,
-    CAST('2025-01-01 00:00:00.000' AS TIMESTAMP(3)) as created_at
-WHERE NOT EXISTS (SELECT 1 FROM real_players);
+  AND player_name IS NOT NULL;
